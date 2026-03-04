@@ -1,0 +1,25 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+
+# Generated kernel files (produced by codegen/generator.py)
+src/kernel/generated/*.c
+src/kernel/generated/codelet_registry.h
+
+# Golden test data (produced by tests/gen_golden.py)
+tests/golden/*.bin
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Environment / secrets — NEVER commit your real .env
+.env
+
+# Editor
+.vscode/
+.idea/
+*.swp
