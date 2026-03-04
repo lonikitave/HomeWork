@@ -1,0 +1,4 @@
+# rvvfft codegen Python dependencies
+jinja2>=3.0
+sympy>=1.9
+numpy>=1.22   # only needed for tests/gen_golden.py
