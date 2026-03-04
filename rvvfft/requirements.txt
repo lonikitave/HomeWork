@@ -1,0 +1,8 @@
+jinja2>=3.1
+sympy>=1.12
+numpy>=1.24
+
+# Multi-agent collaboration (optional — only needed for agents/multi_agent.py)
+pyautogen>=0.2
+python-dotenv>=1.0
+openai>=1.0
