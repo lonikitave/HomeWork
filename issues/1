@@ -1,0 +1,359 @@
+## 项目背景
+
+为贵司RISC-V CPU芯片专用的RVV算子库补充高性能FFT模块，参考FFTW的codelet+planner+executor分层概念，性能目标对标Intel MKL。核心难点包括芯片VLEN可变（优先支持256/1024）、普通RVV指令集（暂不考虑AI复指令，但后续预留扩展）、双数据布局灵活支持，以及自动生成多种kernel以实现顶级性能和移植性。
+
+---
+
+# 🗓️ 2026年度开发详细大纲
+
+## Phase 0：基础设施搭建（3月，已在推进）
+
+| # | 任务 | 产出 | 优先级 |
+|---|------|------|--------|
+| 0.1 | CMake构建系统，支持交叉编译到贵司RISC-V target | `CMakeLists.txt`, toolchain file | P0 |
+| 0.2 | RVV intrinsic开发环境确认：编译器版本（GCC/Clang）、intrinsic头文件、VLEN配置宏 | 编译验证demo | P0 |
+| 0.3 | 模拟器/硬件环境就绪：QEMU-RVV或贵司FPGA/芯片SDK | CI能跑RVV程序 | P0 |
+| 0.4 | benchmark框架原型：cycle计数(rdcycle)、GFLOPS计算、标量C基线 | `bench/`目录 | P1 |
+| 0.5 | 调研芯片微架构特征：向量流水线深度、load/store带宽、cache层次 | 内部文档 | P0 |
+
+---
+
+## Phase 1：基础Kernel原型与生成器开发（4-5月，可并行）
+
+### 核心设计原则
+- **Kernel按VLEN直接特化**：对于VLEN敏感的算法（绝大多数butterfly），按目标VL（256/1024）生成专属最优代码，充分展开循环和寄存器分配。
+- **仅算法与VLEN无关时保持通用**：如部分递归pass、全局bit-reversal等。
+- **尾部处理**：`vsetvl`动态设定VL，不足一个完整向量的尾部采用RVV mask指令（tail-undisturbed策略）保证正确性。
+
+### 4月：基础Butterfly Kernel
+
+| # | 任务 | 细节 |
+|---|------|------|
+| 1.1 | radix-2 butterfly — interleaved复数, f32, VLEN=256 | 手写RVV intrinsic, VL特化循环展开 |
+| 1.2 | radix-2 butterfly — split实/虚, f32, VLEN=256 | 与1.1对比性能差异 |
+| 1.3 | radix-4 butterfly — 两种布局 | 减少twiddle乘法次数 |
+| 1.4 | twiddle factor表生成与向量化加载 | 预计算 + stride/gather load实验 |
+| 1.5 | 正确性验证框架 | 与numpy.fft结果对比, ULP误差统计 |
+
+### 5月：扩展Radix + VLEN=1024 + 生成器原型（并行）
+
+| # | 任务 | 细节 |
+|---|------|------|
+| 1.6 | radix-8 butterfly — VLEN=256 | 更高radix = 更少pass = 更少memory traffic |
+| 1.7 | 所有kernel迁移到VLEN=1024 | 寄存器压力分析，LMUL策略调整 |
+| 1.8 | f64（双精度）kernel变体 | SEW=64, 有效向量元素减半 |
+| 1.9 | 性能基线建立 | 2^10 ~ 2^20 点FFT的cycle/point表 |
+| 1.10 | **代码生成器原型启动**（与kernel开发并行） | AI辅助生成框架骨架，同步进行数学验证模块开发 |
+
+> **里程碑 M1 (5月底):** radix-2/4/8 × split/interleaved × f32/f64 × VLEN=256/1024 共~24个kernel全部通过正确性验证；生成器原型可输出简单codelet。
+
+---
+
+## Phase 2：代码生成器完善（6-7月）
+
+### 生成器架构
+
+```
+┌─────────────────────────────────────────────────┐
+│            Codelet Generator (Python)            │
+│                                                  │
+│  输入参数:                                        │
+│  ├── radix: 2, 4, 8, 16, 32                     │
+│  ├── data_layout: interleaved | split            │
+│  ├── dtype: f32 | f64                            │
+│  ├── vlen: 256 | 1024                            │
+│  ├── lmul: 1, 2, 4, 8                           │
+│  └── custom_ext: none (预留扩展口)                │
+│                                                  │
+│  处理流程:                                        │
+│  ├── 1. 构建 DFT 计算 DAG                        │
+│  ├── 2. 符号化简 (twiddle特殊值优化, SymPy验证)   │
+│  ├── 3. 指令选择 (标准RVV / 未来AI指令)           │
+│  ├── 4. VLEN特化展开 & 寄存器分配                 │
+│  └── 5. 输出 RVV intrinsic C 代码                │
+│                                                  │
+│  模板引擎: Jinja2 | 数学验证: SymPy               │
+└─────────────────────────────────────────────────┘
+```
+
+### 6月：生成器MVP
+
+| # | 任务 | 细节 |
+|---|------|------|
+| 2.1 | DFT计算图（DAG）表示 | Python AST节点：Load, Store, Add, Sub, Mul, TwiddleMul |
+| 2.2 | 符号化简pass + **数学验证** | W(0,N)=1省乘法; W(N/4,N)=−j优化; **SymPy符号验证每个化简规则** |
+| 2.3 | Jinja2模板：RVV intrinsic C输出 | `vfmacc`, `vfmul`, `vle32`, `vse32`等 |
+| 2.4 | 验证：生成代码 vs 手写代码**位级一致** | 自动diff测试 |
+
+### 7月：生成器完善
+
+| # | 任务 | 细节 |
+|---|------|------|
+| 2.5 | LMUL自动选择逻辑 | 根据radix和可用寄存器数计算最优LMUL |
+| 2.6 | AI指令扩展口预留 | `custom_ext`接口，当前默认`none`，未来可插入fused complex mul等 |
+| 2.7 | 批量生成 + 注册表 | 一键生成所有kernel变体，输出`codelet_registry.h` |
+| 2.8 | 替换Phase 1所有手写kernel | 全部切换为生成代码，CI回归测试通过 |
+
+> **里程碑 M2 (7月底):** 代码生成器可一键产出所有codelet变体（~60+），生成代码性能 ≥ 手写代码95%。每个化简规则有SymPy数学证明。
+
+---
+
+## Phase 3：Planner与Executor框架（8-9月）
+
+### 用户API设计
+
+```c
+// Interleaved 布局 — 由用户指定
+rvvfft_plan rvvfft_plan_dft_1d(int n, 
+                                rvvfft_complex *in, 
+                                rvvfft_complex *out,
+                                int sign,          // FORWARD / BACKWARD
+                                unsigned flags);   // ESTIMATE | MEASURE
+
+// Split 布局 — 由用户指定
+rvvfft_plan rvvfft_plan_dft_split_1d(int n,
+                                      float *ri, float *ii,
+                                      float *ro, float *io,
+                                      int sign, unsigned flags);
+
+void rvvfft_execute(const rvvfft_plan plan);
+void rvvfft_destroy_plan(rvvfft_plan plan);
+```
+
+### 8月：Planner
+
+| # | 任务 | 细节 |
+|---|------|------|
+| 3.1 | Plan树数据结构 | 递归分解：N = N1 × N2, 每个叶子节点绑定一个codelet |
+| 3.2 | 分解策略枚举 | Cooley-Tukey (DIT/DIF), split-radix, mixed-radix |
+| 3.3 | ESTIMATE模式 | 启发式选择：优先radix-8 → radix-4 → radix-2 |
+| 3.4 | MEASURE模式 | 实际计时所有候选plan，选最快的 |
+| 3.5 | Wisdom缓存 | 序列化plan到文件，下次直接加载（可随SDK分发） |
+
+### 9月：Executor
+
+| # | 任务 | 细节 |
+|---|------|------|
+| 3.6 | 递归executor | 按plan树递归调用codelet，处理stride/offset |
+| 3.7 | 非递归executor（迭代版） | 减少函数调用开销，更cache-friendly |
+| 3.8 | In-place vs Out-of-place | 两种路径，in-place需要bit-reversal permutation |
+| 3.9 | 实数FFT (R2C / C2R) | 利用共轭对称性，速度翻倍 |
+| 3.10 | 布局调度 | executor根据用户指定的布局(interleaved/split)选择对应kernel路径 |
+| 3.11 | 端到端benchmark | N = 2^10 ~ 2^24, 对比标量C实现 |
+
+> **里程碑 M3 (9月底):** 完整plan → execute流程打通，1D FFT全尺寸工作，双布局均可用，MEASURE模式可自动选择最优plan。
+
+---
+
+## Phase 4：性能优化 — 对标Intel（10-11月）
+
+### 性能对标方法论
+
+采用**峰值百分比法**进行跨架构横向对比：
+
+```
+                    Measured GFLOPS
+效率(%) = ─────────────────────────────── × 100%
+           Theoretical Peak GFLOPS
+
+其中:
+  Theoretical Peak GFLOPS = (VLEN/SEW) × FREQ × FMA_OPS_PER_CYCLE × NUM_CORES
+  Measured GFLOPS = 5 × N × log₂(N) / time_seconds / 1e9
+```
+
+| 对标维度 | 目标值 | Intel MKL参考 |
+|---------|--------|--------------|
+| 峰值效率(%) | ≥ 70% | 75-85% |
+| 标量基线加速比 (VLEN=256) | ≥ 4× | — |
+| 标量基线加速比 (VLEN=1024) | ≥ 10× | — |
+| 大尺寸(N≥2^20)带宽效率 | ≥ 60% 内存带宽利用率 | — |
+
+### 10月：内存子系统优化
+
+| # | 任务 | 细节 |
+|---|------|------|
+| 4.1 | Cache-oblivious递归策略 | 分块大小自适应L1/L2 cache |
+| 4.2 | 向量stride load/store优化 | 避免gather/scatter, 改用连续访问+permutation |
+| 4.3 | Twiddle factor压缩 | 利用对称性减少table大小, 提高cache命中 |
+| 4.4 | 数据预取策略 | 调研芯片HW prefetcher行为，必要时软件预取 |
+| 4.5 | 对齐保证 | 所有buffer按VLEN/8字节对齐 |
+
+### 11月：计算优化
+
+| # | 任务 | 细节 |
+|---|------|------|
+| 4.6 | Codelet内指令调度优化 | 代码生成器加入延迟隐藏：交错load/compute/store |
+| 4.7 | LMUL > 1寄存器分组 | 按VLEN和radix自动选择最优LMUL |
+| 4.8 | Fused operations | 充分使用vfmacc进行twiddle multiply |
+| 4.9 | 多核并行（如适用） | OpenMP或贵司线程库，大FFT按子问题分核 |
+| 4.10 | Roofline分析 | 绘制roofline图，定位每个FFT尺寸是计算瓶颈还是带宽瓶颈 |
+| 4.11 | 全尺寸性能调优 | 逐点分析hotspot，benchmark数据持续更新到本issue |
+
+> **里程碑 M4 (11月底):** 峰值效率 ≥ 70%，VLEN=1024 加速比 > 10×，完整roofline分析报告。
+
+---
+
+## Phase 5：产品化与文档（12月）
+
+| # | 任务 | 产出 |
+|---|------|------|
+| 5.1 | API文档 (Doxygen) | 用户手册，含双布局使用示例 |
+| 5.2 | 性能报告 | 各尺寸/配置/VLEN/布局的详细benchmark数据 |
+| 5.3 | 与贵司其他算子库集成 | 统一构建、统一命名空间 |
+| 5.4 | 示例代码 + 快速上手指南 | `examples/`目录 |
+| 5.5 | 代码生成器使用文档 | 让其他同事能新增kernel变体 |
+| 5.6 | 2027路线图草案 | 2D/3D FFT、batch FFT、更多radix、新芯片/新指令适配 |
+
+> **里程碑 M5 (12月底):** v1.0发布，支持1D C2C/R2C FFT，双布局，VLEN=256/1024，附带完整文档和benchmark。
+
+---
+
+## 关键技术细节
+
+### 1. 可变VL的Kernel特化策略
+
+| 场景 | 策略 | 说明 |
+|------|------|------|
+| Butterfly kernel (radix-2/4/8) | **按VLEN特化** | 针对256/1024分别生成，循环展开、寄存器分配均不同 |
+| Bit-reversal permutation | VL-agnostic | 与VLEN无关的index计算 |
+| Twiddle factor加载 | **按VLEN特化** | 连续load宽度直接取决于VL |
+| 尾部不足一个完整向量 | mask处理 | `vsetvl`设定实际VL + tail-undisturbed |
+
+### 2. 数据布局支持
+
+| 布局 | 内存格式 | 适用场景 | 用户接口 |
+|------|---------|---------|---------|
+| 交错 (interleaved) | `[r0, i0, r1, i1, ...]` | 与外部库数据格式兼容 | `rvvfft_plan_dft_1d()` |
+| 分离 (split) | `real[]: [r0, r1, ...]` + `imag[]: [i0, i1, ...]` | RVV向量load更高效 | `rvvfft_plan_dft_split_1d()` |
+
+- 布局**由用户在API调用时指定**，planner/executor自动选择对应kernel路径
+- 内核调度层针对不同布局优选kernel和内存访问模式
+
+### 3. 代码生成器与AI辅助
+
+- AI可辅助高效生成codelet代码和模板，**但每个生成规则必须有数学原理验证**：
+  - 符号化简规则用 **SymPy** 验证（如 W(k,N) 的特殊值化简）
+  - FFT 递归分解的正确性用小规模精确比对验证
+  - 生成代码与手写参考代码做位级 diff
+- 自动化测试集覆盖：所有 VLEN × 布局 × radix × 数据类型 组合
+
+### 4. AI指令扩展机制
+
+- **当前**：全部使用标准 RVV 1.0 指令实现复数运算（vfmul/vfadd/vfmacc 组合）
+- **未来预留**：代码生成器的指令选择层设计为可插拔：
+  ```
+  instruction_backend:
+    ├── rvv_standard  (默认，当前使用)
+    └── rvv_ai_ext    (预留，未来芯片支持fused complex mul等时启用)
+  ```
+- Kernel代码区分「有AI指令」与「无AI指令」两条路径，编译时通过宏选择，保证前向兼容
+
+### 5. 正确性量化标准
+
+| 精度 | 最大相对误差 | 最大ULP误差 | 参考实现 |
+|------|------------|-----------|---------|
+| f32 (float) | ≤ 1e-6 | ≤ 4 ULP | NumPy FFT (f64计算后截断) |
+| f64 (double) | ≤ 1e-14 | ≤ 4 ULP | NumPy FFT (f64) |
+
+- Golden data 由 Python 脚本自动生成并存储
+- CI 中每个 kernel 变体逐点比对，统计 max/mean/p99 ULP
+- 异常值自动定位到具体 radix/stage/index
+
+### 6. 性能对标方法论
+
+**三层对标体系：**
+
+| 层级 | 指标 | 计算方式 | 目标 |
+|------|------|---------|------|
+| L1: 绝对性能 | GFLOPS | 5N·log₂(N) / time | 持续跟踪 |
+| L2: 本平台效率 | 峰值百分比 | Measured / Theoretical Peak × 100% | ≥ 70% |
+| L3: 跨架构对比 | 效率差距 | 本平台效率 vs Intel MKL效率(75-85%) | 差距 < 15% |
+
+辅助指标：
+- 标量C基线加速比：VLEN=256 ≥ 4×, VLEN=1024 ≥ 10×
+- 大尺寸(N≥2^20)内存带宽利用率 ≥ 60%
+- Roofline图定位瓶颈（计算 bound vs 带宽 bound）
+- Benchmark数据随迭代**持续更新到本issue评论区**
+
+### 7. 项目目录结构
+
+```
+rvvfft/
+├── include/                    # 公共API头文件
+│   ├── rvvfft.h               # 主API (interleaved + split)
+│   └── rvvfft_types.h         # 类型定义、常量、宏
+├── src/
+│   ├── kernel/                # codelet (手写 + 自动生成)
+│   │   ├── generated/         # 生成器产出的kernel源文件
+│   │   └── handwritten/       # 参考手写kernel (用于验证)
+│   ├── planner/               # FFT plan构建与策略选择
+│   │   ├── planner.c
+│   │   └── wisdom.c           # wisdom序列化/反序列化
+│   ├── executor/              # 执行引擎
+│   │   ├── executor_recursive.c
+│   │   └── executor_iterative.c
+│   ├── layout/                # 数据布局适配层
+│   │   ├── interleaved.c
+│   │   └── split.c
+│   └── utils/
+│       ├── twiddle.c          # twiddle factor表生成
+│       ├── alignment.c        # 内存对齐工具
+│       └── bitrev.c           # bit-reversal permutation
+├── codegen/                   # 代码生成器 (Python)
+│   ├── generator.py           # 主生成脚本
+│   ├── dag.py                 # DFT计算DAG构建
+│   ├── simplify.py            # 符号化简 (SymPy验证)
+│   ├── templates/             # Jinja2 kernel模板
+│   │   ├── butterfly.c.j2
+│   │   └── twiddle.c.j2
+│   └── verify_math.py         # 数学规则自动验证脚本
+├── bench/                     # 性能benchmark
+│   ├── bench_main.c
+│   ├── bench_utils.c          # rdcycle/GFLOPS计算
+│   └── roofline/              # roofline分析工具
+├── tests/                     # 正确性测试
+│   ├── test_correctness.c     # C端测试driver
+│   ├── golden/                # NumPy生成的golden data
+│   └── gen_golden.py          # golden data生成脚本
+├── examples/                  # 使用示例
+│   ├── example_c2c.c
+│   ├── example_r2c.c
+│   └── example_split.c
+├── docs/                      # 文档
+│   ├── api_reference.md
+│   └── codegen_guide.md
+├── CMakeLists.txt             # 主构建文件
+└── toolchain-riscv.cmake      # 贵司芯片交叉编译toolchain
+```
+
+---
+
+## 里程碑总览
+
+```
+3月        4月        5月        6月        7月        8月        9月        10月       11月       12月
+│──Phase0──│──────Phase 1───────│──────Phase 2───────│──────Phase 3───────│──────Phase 4───────│──Phase5──│
+│ 基础设施  │ Kernel + 生成器并行 │   生成器完善        │  Planner+Executor  │  性能对标Intel     │  产品化  │
+│          │                    │                    │                    │                    │          │
+▼          ▼                    ▼                    ▼                    ▼                    ▼          ▼
+M0         ·                    M1                   M2                   M3                   M4         M5
+环境就绪    ·              24个kernel          60+生成kernel       全流程打通         ≥70%峰值     v1.0发布
+           ·              生成器原型          SymPy数学验证       双布局可用         >10×加速     完整文档
+```
+
+---
+
+## 风险与缓解
+
+| 风险 | 影响 | 缓解措施 |
+|------|------|---------|
+| 芯片硬件/模拟器不稳定 | 阻塞全部开发 | Phase 0提前验证; 保持QEMU备用路径 |
+| RVV intrinsic编译器bug | kernel开发受阻 | 建compiler bug tracker; 必要时回退手写汇编 |
+| 生成器数学验证不充分 | 生成代码可能有隐蔽错误 | SymPy符号验证 + 全组合golden test双保险 |
+| 性能达不到70%峰值 | 对标Intel目标受挫 | Roofline分析定位瓶颈; 与芯片设计团队联合调优 |
+| 未来AI指令规格变动 | 扩展口需要重新适配 | 指令后端可插拔设计，变动只影响一个模块 |
+| 人力不足 | 进度延迟 | Phase 1 kernel+生成器并行; 争取1-2人支援 |
+
+---
+
+如需技术方案分解、算法理论推导、代码实现demo或具体阶段拆解，可在issue下留言继续讨论。
