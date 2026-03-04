@@ -1,0 +1,72 @@
+{# butterfly.c.j2 — Jinja2模板：RVV butterfly codelet C代码 #}
+{# 参数：radix, layout, dtype, vlen, lmul, sign, ctype, sew, suffix #}
+/**
+ * {{ suffix }}.c — 自动生成的FFT codelet
+ *
+ * 生成参数:
+ *   radix:  {{ radix }}
+ *   layout: {{ layout }}
+ *   dtype:  {{ dtype }}
+ *   vlen:   {{ vlen }}
+ *   lmul:   {{ lmul }}
+ */
+#include <stddef.h>
+#include "../../../include/rvvfft_types.h"
+
+#ifdef RVVFFT_USE_RVV
+#include <riscv_vector.h>
+
+void rvvfft_{{ suffix }}(
+    const {{ ctype }} *ri, const {{ ctype }} *ii,
+    {{ ctype }}       *ro, {{ ctype }}       *io,
+    const {{ ctype }} *tw,
+    ptrdiff_t          stride,
+    int                n,
+    int                sign)
+{
+    (void)sign;
+    int group = n / {{ radix }};
+
+    if (stride != 1) {
+        /* 非连续访问退回到标量版本 */
+        return;
+    }
+
+    {% set vl_size = vlen // (32 if dtype == "f32" else 64) %}
+    /* VLEN={{ vlen }}, SEW={{ sew }}, LMUL={{ lmul }} → 每次处理{{ vl_size }}个元素 */
+    int remaining = group, off = 0;
+    while (remaining > 0) {
+        size_t vl = __riscv_vsetvl_e{{ sew }}m{{ lmul }}((size_t)remaining);
+
+        {% for k in range(radix) %}
+        /* 加载第{{ k }}组 */
+        {% if layout == "split" %}
+        vfloat{{ sew }}m{{ lmul }}_t vr{{ k }} = __riscv_vle{{ sew }}_v_f{{ sew }}m{{ lmul }}(ri + {{ k }} * group + off, vl);
+        vfloat{{ sew }}m{{ lmul }}_t vi{{ k }} = __riscv_vle{{ sew }}_v_f{{ sew }}m{{ lmul }}(ii + {{ k }} * group + off, vl);
+        {% else %}
+        /* interleaved: vlseg2e{{ sew }} */
+        vfloat{{ sew }}m{{ lmul }}x2_t vseg{{ k }} = __riscv_vlseg2e{{ sew }}_v_f{{ sew }}m{{ lmul }}x2(ri + {{ k * 2 }} * group + off * 2, vl);
+        vfloat{{ sew }}m{{ lmul }}_t vr{{ k }} = __riscv_vget_v_f{{ sew }}m{{ lmul }}x2_f{{ sew }}m{{ lmul }}(vseg{{ k }}, 0);
+        vfloat{{ sew }}m{{ lmul }}_t vi{{ k }} = __riscv_vget_v_f{{ sew }}m{{ lmul }}x2_f{{ sew }}m{{ lmul }}(vseg{{ k }}, 1);
+        {% endif %}
+        {% endfor %}
+
+        /* TODO: butterfly运算（由DAG展开器填充） */
+
+        {% for k in range(radix) %}
+        /* 写回第{{ k }}组 */
+        {% if layout == "split" %}
+        __riscv_vse{{ sew }}_v_f{{ sew }}m{{ lmul }}(ro + {{ k }} * group + off, vr{{ k }}, vl);
+        __riscv_vse{{ sew }}_v_f{{ sew }}m{{ lmul }}(io + {{ k }} * group + off, vi{{ k }}, vl);
+        {% else %}
+        vfloat{{ sew }}m{{ lmul }}x2_t out{{ k }} = __riscv_vcreate_v_f{{ sew }}m{{ lmul }}x2(vr{{ k }}, vi{{ k }});
+        __riscv_vsseg2e{{ sew }}_v_f{{ sew }}m{{ lmul }}x2(ro + {{ k * 2 }} * group + off * 2, out{{ k }}, vl);
+        {% endif %}
+        {% endfor %}
+
+        off       += (int)vl;
+        remaining -= (int)vl;
+    }
+}
+
+#endif /* RVVFFT_USE_RVV */

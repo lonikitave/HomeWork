@@ -1,0 +1,25 @@
+{# twiddle.c.j2 — Jinja2模板：Twiddle factor表加载代码片段 #}
+{# 参数：n, radix, vlen, lmul, dtype, sew #}
+    /*
+     * Twiddle factor加载：W^k = tw_real[k] + j·tw_imag[k]
+     * 预计算表按VLEN={{ vlen }}对齐，连续加载无需gather。
+     * 表长度：{{ n // radix }}（= n / {{ radix }}）
+     */
+    {% set tw_len = n // radix %}
+    /* 加载twiddle实部和虚部 */
+    vfloat{{ sew }}m{{ lmul }}_t vtw_r = __riscv_vle{{ sew }}_v_f{{ sew }}m{{ lmul }}(tw + off, vl);
+    vfloat{{ sew }}m{{ lmul }}_t vtw_i = __riscv_vle{{ sew }}_v_f{{ sew }}m{{ lmul }}(tw + {{ tw_len }} + off, vl);
+
+    /*
+     * 复数乘法：t = W · x
+     *   tr = tw_r * xr - tw_i * xi    (vfmul + vfnmsac)
+     *   ti = tw_i * xr + tw_r * xi    (vfmul + vfmacc)
+     *
+     * vfmacc(acc, a, b): acc += a * b
+     * vfnmsac(acc, a, b): acc -= a * b
+     */
+    vfloat{{ sew }}m{{ lmul }}_t vtr = __riscv_vfmul_vv_f{{ sew }}m{{ lmul }}(vtw_r, vxr, vl);
+    vtr = __riscv_vfnmsac_vv_f{{ sew }}m{{ lmul }}(vtr, vtw_i, vxi, vl);
+
+    vfloat{{ sew }}m{{ lmul }}_t vti = __riscv_vfmul_vv_f{{ sew }}m{{ lmul }}(vtw_i, vxr, vl);
+    vti = __riscv_vfmacc_vv_f{{ sew }}m{{ lmul }}(vti, vtw_r, vxi, vl);
